@@ -5,6 +5,8 @@ import acoustid
 import os
 import shutil
 import requests
+import musicbrainzngs
+import mutagen
 
 app = FastAPI()
 
@@ -17,15 +19,16 @@ app.add_middleware(
 )
 
 # --- CONFIGURATION ---
-ACOUSTID_API_KEY = 'jydFmoPBJ4'  # <--- PASTE YOUR KEY HERE
+ACOUSTID_API_KEY = 'jydFmoPBJ4' # <--- Ensure this is set
+# Configure MusicBrainz (Required User Agent)
+musicbrainzngs.set_useragent("MyAudioApp", "1.0", "contact@myapp.com")
 
 shazam = Shazam()
 
 def get_cover_art(mbid):
-    """Try to fetch cover art from Cover Art Archive using MusicBrainz ID"""
+    """Try to fetch cover art from Cover Art Archive"""
     try:
         url = f"http://coverartarchive.org/release/{mbid}/front"
-        # Check if it exists (HEAD request)
         r = requests.head(url, allow_redirects=True, timeout=2)
         if r.status_code == 200:
             return r.url
@@ -45,7 +48,7 @@ async def recognize_audio(file: UploadFile = File(...)):
         metadata = None
 
         # --- STRATEGY 1: SHAZAM (Best for Commercial/Pop) ---
-        print("Trying Shazam...")
+        print("Strategy 1: Trying Shazam...")
         try:
             out = await shazam.recognize_song(temp_filename)
             if out and 'track' in out:
@@ -63,44 +66,71 @@ async def recognize_audio(file: UploadFile = File(...)):
         except Exception as e:
             print(f"Shazam error: {e}")
 
-        # --- STRATEGY 2: ACOUSTID (Fallback for Files) ---
+        # --- STRATEGY 2: ACOUSTID (Fingerprint Fallback) ---
         if status == 'no_match':
-            print("Shazam failed. Trying AcoustID...")
+            print("Strategy 2: Shazam failed. Trying AcoustID...")
             try:
-                # AcoustID lookup (includes recordings and releases to find cover art)
                 results = acoustid.match(ACOUSTID_API_KEY, temp_filename, parse=False, meta='recordings releases')
-                
-                # Check results manually to get the best match
                 if results.get('results'):
-                    best_match = results['results'][0] # Take the highest score
-                    if best_match.get('score', 0) > 0.5: # Only accept good matches
-                        recordings = best_match.get('recordings', [])
-                        if recordings:
-                            rec = recordings[0] # Take first recording
+                    best_match = results['results'][0]
+                    if best_match.get('score', 0) > 0.5:
+                        rec = best_match.get('recordings', [])[0] if best_match.get('recordings') else None
+                        if rec:
+                            mbid = rec.get('releases', [{}])[0].get('id')
+                            cover_url = get_cover_art(mbid) if mbid else None
+                            artist_name = ", ".join([a['name'] for a in rec.get('artists', [])])
                             
-                            # Try to find a release MBID for cover art
-                            mbid_for_cover = None
-                            if 'releases' in rec:
-                                mbid_for_cover = rec['releases'][0]['id']
-                            
-                            cover_url = get_cover_art(mbid_for_cover) if mbid_for_cover else None
-                            
-                            artist_name = "Unknown"
-                            if 'artists' in rec:
-                                artist_name = ", ".join([a['name'] for a in rec['artists']])
-
                             status = 'matched'
                             metadata = {
                                 'title': rec.get('title'),
                                 'artist': artist_name,
-                                'cover': cover_url, # Fallback cover
-                                'isrc': None, # AcoustID rarely has ISRC
+                                'cover': cover_url,
+                                'isrc': None,
                                 'link': f"https://musicbrainz.org/recording/{rec['id']}",
                                 'label': None,
                                 'source': 'AcoustID'
                             }
             except Exception as e:
                 print(f"AcoustID error: {e}")
+
+        # --- STRATEGY 3: MUSICBRAINZ TEXT SEARCH (Metadata Fallback) ---
+        if status == 'no_match':
+            print("Strategy 3: AcoustID failed. Checking File Metadata...")
+            try:
+                # 1. Read Tags from the file
+                audio = mutagen.File(temp_filename, easy=True)
+                if audio:
+                    # Try to extract Artist and Title
+                    # Different formats use different keys, but 'easy=True' standardizes many
+                    artist = audio.get('artist', [None])[0]
+                    title = audio.get('title', [None])[0]
+
+                    if artist and title:
+                        print(f"Found Tags: {artist} - {title}. Searching MusicBrainz...")
+                        # 2. Search MusicBrainz Database
+                        search_res = musicbrainzngs.search_recordings(artist=artist, recording=title, limit=1)
+                        
+                        if search_res.get('recording-list'):
+                            rec = search_res['recording-list'][0]
+                            # Calculate a simple confidence check (exact match preference)
+                            if rec['title'].lower() == title.lower():
+                                mbid_for_cover = rec.get('release-list', [{}])[0].get('id')
+                                cover_url = get_cover_art(mbid_for_cover) if mbid_for_cover else None
+                                
+                                artist_name = rec.get('artist-credit', [{}])[0].get('artist', {}).get('name', artist)
+
+                                status = 'matched'
+                                metadata = {
+                                    'title': rec['title'],
+                                    'artist': artist_name,
+                                    'cover': cover_url,
+                                    'isrc': rec.get('isrc-list', [None])[0],
+                                    'link': f"https://musicbrainz.org/recording/{rec['id']}",
+                                    'label': None,
+                                    'source': 'MusicBrainz (Metadata)'
+                                }
+            except Exception as e:
+                print(f"MusicBrainz Search error: {e}")
 
         return {"status": status, "data": metadata}
 
@@ -109,4 +139,3 @@ async def recognize_audio(file: UploadFile = File(...)):
     finally:
         if os.path.exists(temp_filename):
             os.remove(temp_filename)
-
