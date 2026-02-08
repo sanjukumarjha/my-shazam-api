@@ -3,3 +3,5 @@ uvicorn
 shazamio
 python-multipart
 pydub
+pyacoustid
+requests
