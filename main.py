@@ -17,7 +17,7 @@ app.add_middleware(
 )
 
 # --- CONFIGURATION ---
-ACOUSTID_API_KEY = 'YOUR_ACOUSTID_KEY_HERE'  # <--- PASTE YOUR KEY HERE
+ACOUSTID_API_KEY = 'jydFmoPBJ4'  # <--- PASTE YOUR KEY HERE
 
 shazam = Shazam()
 
@@ -109,3 +109,4 @@ async def recognize_audio(file: UploadFile = File(...)):
     finally:
         if os.path.exists(temp_filename):
             os.remove(temp_filename)
+
